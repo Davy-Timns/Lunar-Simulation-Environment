@@ -8,6 +8,9 @@ class StarTracker:
         self.name = name                                #Name of the sensor
         self.model = starTracker.StarTracker()          #Star tracker model init
         self.model.ModelTag = name                      #Tag the model with the name as well
+        # Installed Basilisk versions differ here: identity A produces an
+        # unbounded random walk. This sensor example specifies white noise.
+        self.model.setAMatrix([[0.,0.,0.],[0.,0.,0.],[0.,0.,0.]])
 
         self.model.dcm_CB = [                           #DCM of body to case
             [1.0, 0.0, 0.0],

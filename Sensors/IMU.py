@@ -7,6 +7,9 @@ class IMU:
     def __init__(self, name="IMU"):
         self.name = name
         self.model = imuSensor.ImuSensor()
+        # This configuration specifies white gyro noise. Some installed Basilisk
+        # versions default to identity A, accumulating an unbounded random walk.
+        self.model.setAMatrixGyro([[0., 0., 0.], [0., 0., 0.], [0., 0., 0.]])
 
         #print(imuSensor.ImuSensor.__module__)               #Debug prints
         #print(dir(imuSensor.ImuSensor))                     #Debug prints

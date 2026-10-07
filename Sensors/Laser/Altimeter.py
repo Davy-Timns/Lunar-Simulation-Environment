@@ -23,6 +23,15 @@ class LaserAltimeter(sysModel.SysModel):
         self.model = model
         self.data = data
         self.laser_id = laser_id
+        # Fixed mount calibration shared with navigation. Read the actual site
+        # configuration so changing its XML orientation also changes range-to-Z
+        # reconstruction; no truth attitude or position is used here.
+        if self.model.site_bodyid[laser_id] != mujoco.mj_name2id(model,mujoco.mjtObj.mjOBJ_BODY,'spacecraft'):
+            raise ValueError('Laser site must be mounted directly on the spacecraft body')
+        self.laser_offset_B=np.array(self.model.site_pos[laser_id],dtype=float)
+        site_rotation=np.zeros(9)
+        mujoco.mju_quat2Mat(site_rotation,self.model.site_quat[laser_id])
+        self.laser_direction_B=site_rotation.reshape(3,3)[:,2].copy()
         self.spacecraft_collision_geom_names = ( #Splits the spacecraft up into different GEOMs for collision detection. Otherwise the spacecraft is treated as a square and the spacecraft is purely visualization.
             "spacecraft_core",
             "spacecraft_leg_1", #Since we only have four legs here, this isnt totally analogous to IMX, but it's close enough
@@ -52,6 +61,7 @@ class LaserAltimeter(sysModel.SysModel):
 
         #Basilisk input: spacecraft state
         self.scStateInMsg = messaging.SCStatesMsgReader()
+        self.scMassInMsg = messaging.SCMassPropsMsgReader()
 
         # Basilisk outputs
         self.sensorOutMsg = messaging.NavTransMsg()
@@ -60,6 +70,8 @@ class LaserAltimeter(sysModel.SysModel):
 
         # Sensor output initialization
         self.altitude = np.nan
+        self.range_valid = False
+        self.range_time_s = -np.inf
         self.hit_geom = -1
 
         # logs
@@ -151,6 +163,22 @@ class LaserAltimeter(sysModel.SysModel):
             if (mujoco.mj_id2name(model,mujoco.mjtObj.mjOBJ_GEOM,geom_id)or "").startswith("spacecraft_foot_")
         ]
 
+        # Static body-frame foot corners: control transforms these with its
+        # navigation/attitude state, without reading the truth contact pose.
+        foot_points = []
+        for geom_id in self.surface_contact_geom_ids:
+            if (model.geom_bodyid[geom_id] != self.spacecraft_body_id
+                    or model.geom_type[geom_id] != mujoco.mjtGeom.mjGEOM_BOX):
+                raise ValueError('Landing-foot calibration requires body-mounted box geoms')
+            rotation = np.zeros(9)
+            mujoco.mju_quat2Mat(rotation, model.geom_quat[geom_id])
+            for sx in (-1., 1.):
+                for sy in (-1., 1.):
+                    for sz in (-1., 1.):
+                        corner = model.geom_size[geom_id] * [sx, sy, sz]
+                        foot_points.append(model.geom_pos[geom_id] + rotation.reshape(3, 3) @ corner)
+        self.landing_foot_points_B = np.asarray(foot_points, dtype=float).reshape(-1, 3)
+
         self.spacecraft_joint_id = mujoco.mj_name2id(model,mujoco.mjtObj.mjOBJ_JOINT,"spacecraft_freejoint")
         if self.spacecraft_joint_id < 0:
             raise RuntimeError("MuJoCo model is missing joint 'spacecraft_freejoint'.")
@@ -186,8 +214,13 @@ class LaserAltimeter(sysModel.SysModel):
         if not self.scStateInMsg.isLinked():
             self.bskLogger.bskLog(bskLogging.BSK_ERROR,"LaserAltimeter.scStateInMsg is not linked.")
 
+        self.altitude = np.nan
+        self.range_valid = False
+        self.range_time_s = -np.inf
+        self._previous_update_time_s = None
+        self._debug_step_counter = 0
         payload = self.sensorOutMsg.zeroMsgPayload
-        payload.timeTag = CurrentSimNanos
+        payload.timeTag = CurrentSimNanos * 1e-9
         payload.r_BN_N = [0.0, 0.0, 0.0]
         payload.v_BN_N = [0.0, 0.0, 0.0]
 
@@ -222,6 +255,8 @@ class LaserAltimeter(sysModel.SysModel):
         # READ BASILISK STATE
 
         scState = self.scStateInMsg()
+        if self.scMassInMsg.isLinked() and self.scMassInMsg.isWritten():
+            self.spacecraft_mass = float(self.scMassInMsg().massSC)
 
         r_BN_N = np.array(scState.r_BN_N, dtype=float)
         v_BN_N = np.array(scState.v_BN_N, dtype=float)
@@ -234,9 +269,11 @@ class LaserAltimeter(sysModel.SysModel):
         C_NB = C_BN.T
         omega_BN_N = C_NB @ omega_BN_B
 
-        C_mjc = (R_bsk_to_mjc @ C_NB @ R_bsk_to_mjc.T)
-
-        q_mjc = RigidBodyKinematics.C2EP(C_mjc)
+        # XML geometry uses the same BODY axes as Basilisk. Only the inertial
+        # coordinates change; conjugating by R also rotates the body axes.
+        C_mjc = R_bsk_to_mjc @ C_NB
+        q_mjc = np.zeros(4)
+        mujoco.mju_mat2Quat(q_mjc, C_mjc.ravel())
 
         v_mjc = R_bsk_to_mjc @ v_BN_N
         omega_mjc = R_bsk_to_mjc @ omega_BN_N
@@ -247,7 +284,7 @@ class LaserAltimeter(sysModel.SysModel):
         self.data.qpos[qpos_adr:qpos_adr + 3] = r_mjc
         self.data.qpos[qpos_adr + 3:qpos_adr + 7] = q_mjc
         self.data.qvel[qvel_adr:qvel_adr + 3] = v_mjc
-        self.data.qvel[qvel_adr + 3:qvel_adr + 6] = omega_mjc
+        self.data.qvel[qvel_adr + 3:qvel_adr + 6] = omega_BN_B
 
         mujoco.mj_normalizeQuat(self.model,self.data.qpos)
 
@@ -269,8 +306,9 @@ class LaserAltimeter(sysModel.SysModel):
 
         #  MUJOCO -> BASILISK
 
-        print("Contact force: ", F_N, "Torque: ", torque_B)
-
+        if self.debug_contacts and self._debug_step_counter % max(1,self.debug_contact_every_n_steps) == 0:
+            print(f"Sim {current_time_s:9.2f} s | contact={self.collision} | "
+                  f"Contact force: {F_N} N | Torque: {torque_B} Nm", flush=True)
         self.publish_contact_loads(F_N,torque_B, CurrentSimNanos)
 
         #LASER ALTIMETER
@@ -279,13 +317,16 @@ class LaserAltimeter(sysModel.SysModel):
 
         payload = self.sensorOutMsg.zeroMsgPayload
 
-        payload.timeTag = CurrentSimNanos
+        payload.timeTag = current_time_s
 
         payload.r_BN_N = [0.0, 0.0,self.altitude]
 
         payload.v_BN_N = [0.0, 0.0, 0.0]
 
         self.sensorOutMsg.write(payload, CurrentSimNanos,self.moduleID)
+        # The legacy NavTrans-shaped log above is RANGE, not a position fix.
+        self.range_time_s = current_time_s
+        self.range_valid = bool(np.isfinite(self.altitude) and self.altitude >= 0 and self.hit_geom >= 0)
 
 
     def laser_altimeter(self):
