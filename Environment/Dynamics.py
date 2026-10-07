@@ -1,5 +1,6 @@
 from Basilisk.utilities import macros, simIncludeGravBody
 from Basilisk.utilities import orbitalMotion
+from Basilisk.simulation import gravityEffector
 from typing import Dict
 
 r_moon = 1737400  # radius of the moon in meters
@@ -11,8 +12,10 @@ r_earth = 6378136.6  # meters^3/s^2
 
 
 
-def initialize_dynamics(sim, sc,DEBUG_DISABLE_GRAVITY = False, CLOSE=False):
+def initialize_dynamics(sim, sc,DEBUG_DISABLE_GRAVITY = False, CLOSE=False, LUNAR_ONLY=False):
     gravFactory = simIncludeGravBody.gravBodyFactory()
+    # Vizard needs the Moon's parent Earth (and the Sun for Earth's orbit).
+    # Export their ephemerides even when the plant uses only lunar gravity.
     gravFactory.createSun()
 
     mu_moonL = mu_moon
@@ -42,10 +45,15 @@ def initialize_dynamics(sim, sc,DEBUG_DISABLE_GRAVITY = False, CLOSE=False):
     gravFactory.spiceObject.zeroBase = "moon"
 
 
-    sim.AddModelToTask("record", gravFactory.spiceObject)
+    sim.AddModelToTask("record", gravFactory.spiceObject, ModelPriority=15)
 
-    gravFactory.addBodiesTo(sc.lander)
-    sim.AddModelToTask("record", sc.lander)
+    sc.gravity_factory = gravFactory
+    sc.visualization_bodies = list(gravFactory.gravBodies.values())
+    if LUNAR_ONLY:
+        sc.lander.gravField.setGravBodies(gravityEffector.GravBodyVector([moon]))
+    else:
+        gravFactory.addBodiesTo(sc.lander)
+    sim.AddModelToTask("record", sc.lander, ModelPriority=5)
 
 
 def initialize_vehicle_dynamics_parameters(sc, orbital_params:Dict[str,float] | None = None,spacecraft_velocity_override = None, spacecraft_position_override = None):

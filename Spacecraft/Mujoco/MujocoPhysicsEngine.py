@@ -204,7 +204,7 @@ def get_xml(LF):
 
                         <site name="laser_altimeter"
                               pos="0 0 -0.30"
-                              euler="90 0 0"
+                              euler="180 0 0"
                               size="0.03"/>
 
                     </body>
@@ -256,7 +256,7 @@ def get_xml(LF):
 
                     <site name="laser_altimeter"
                           pos="0 0 -0.30"
-                          euler="90 0 0"
+                          euler="180 0 0"
                           size="0.03"/>
 
                 </body>
@@ -309,7 +309,7 @@ def get_xml(LF):
 
                     <site name="laser_altimeter"
                           pos="0 0 -0.30"
-                          euler="90 0 0"
+                          euler="180 0 0"
                           size="0.03"/>
 
                 </body>
