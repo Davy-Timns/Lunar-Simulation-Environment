@@ -26,7 +26,9 @@ TERRAIN_SCALE = [10.0, 10.0, 10.0]
 
 
 def _matrix_to_vizard_321(matrix):
-    return Rotation.from_matrix(matrix).as_euler("zyx", degrees=False).tolist()
+    # Vizard's CustomModel.Rotation fields are x,y,z; its Unity assignment is
+    # Quaternion.Euler(y,z,-x). Reverse scipy's [z,y,x] result before exporting.
+    return Rotation.from_matrix(matrix).as_euler("zyx", degrees=False)[::-1].tolist()
 
 
 TERRAIN_ROTATION_VIZARD = _matrix_to_vizard_321(

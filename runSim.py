@@ -1,9 +1,7 @@
 from Spacecraft.Vehicle import Vehicle
 from Spacecraft.Thrusters.Thrusters import RCS_thruster, MainEngine, make_config
-from Spacecraft.Thrusters.DescentGuidance import DescentSettings, LandingTarget, InfeasibleDescent, DescentSearchLimit
-from Spacecraft.Thrusters.DescentScenario import (
-    example_post_doi_state, apply_initial_state, prepare_powered_descent_start, initialize_simulation_at,
-)
+from Spacecraft.GNC.Guidance import DescentSettings, LandingTarget, InfeasibleDescent, DescentSearchLimit
+from Spacecraft.GNC.Guidance import example_post_doi_state, apply_initial_state, prepare_powered_descent_start, initialize_simulation_at
 import matplotlib
 from scipy.spatial.transform import Rotation as R
 from matplotlib.animation import FuncAnimation
@@ -17,10 +15,12 @@ from Sensors.Sensors import SensorsManager
 import Environment.Dynamics as Dynamics
 from Visualization import initialize_vizard
 from Environment import Environment as Env
-from Environment.TerrainMap import TerrainMap
-from Sensors.TerrainNavigation import TerrainNavigation, NavigationSettings
-from Sensors.AttitudeNavigation import AttitudeNavigation
-from Spacecraft.Thrusters.DescentDiagnostics import TouchdownDiagnostics
+from Spacecraft.GNC.Navigation import TerrainMap
+from Environment.VizardTerrain import prepare_vizard_terrain, preview_position, centered_terrain_offset
+from Spacecraft.Mujoco.MujocoPhysicsEngine import OBJ_NAME
+from Spacecraft.Mujoco import FrameTransforms as TerrainFrame
+from Spacecraft.GNC.Navigation import TerrainNavigation, NavigationSettings
+from Spacecraft.GNC.Control import TouchdownDiagnostics
 
 matplotlib.use("TkAgg")
 
@@ -34,10 +34,13 @@ LOW_FIDELITY_SURFACE = 1 #If CLOSE_TO_LUNAR_SURFACE is false, you may want this 
 DISABLE_GRAVITY = False #True -> Turns off all gravity with the exception of the sun.
 
 # "a2g": post-DOI coast, then fuel-optimized powered descent with real gimbal/RCS limits.
-# "constant": the previous dummy controller, using CONSTANT_ON_ENGINES below.
+# "constant": constant open-loop control, using CONSTANT_ON_ENGINES below.
 PROPULSION_MODE = "a2g"
-MODEL_CHECK_ONLY = True  # True: quick spacecraft/plume preview in open space; bypasses descent
+MODEL_CHECK_ONLY = False  # True: spacecraft/plume + terrain preview; bypasses descent and sensors
 MODEL_CHECK_DURATION_S = 5.0
+MODEL_CHECK_CLEARANCE_M = 30.0  # above the rendered surface under IMX; preview has no contact physics
+VIZ_TERRAIN_GRID_CELLS = 180  # display simplification only; 2..250, higher retains more detail
+VIZ_MODEL_GRID_CELLS = 32  # 3D display simplification for large lander CAD; 2..39
 START_AT_POWERED_DESCENT = True  # False: full post-DOI coast; True: begin at powered-descent ignition
 DESCENT_DRY_MASS_KG = 700.0
 DESCENT_MIN_THROTTLE = 0.1
@@ -67,7 +70,7 @@ NAVIGATION_SETTINGS = NavigationSettings(filter_enabled=ENABLE_NAVIGATION_FILTER
 CONTACT_LOG_EVERY_N_STEPS = 100  # set to 1 for every physics step; 100 = once/s at samp=.01
 DESCENT_SETTLING_S = 5.0
 
-# Dummy propulsion settings. These are illustrative values, not calibrated IMX hardware.
+# Constant propulsion settings. These are illustrative values, not calibrated IMX hardware.
 # Selected engines stay on at their configured thrust for the entire simulation.
 # Use () to coast; for example ("MainEngine", "RCS_1_1") fires those two engines.
 CONSTANT_ON_ENGINES = ("MainEngine")
@@ -154,10 +157,20 @@ process.addTask(task)                                               # Add create
 #Continued simulation modules setup
 sc=Vehicle(sim, SPACECRAFT_BODY_NAME, sampling_ns, spacecraft_attitude_MRP, spacecraft_attitude_rate, spacecraft_mass, spacecraft_inertia)                                #initialize the vehicle
 
-# The model preview needs only the spacecraft, engines and playback writer.
+# Keep the terrain visualization anchor in both preview and descent recordings.
+sc.terrain = Env.create_terrain_spacecraft()
+if MODEL_CHECK_ONLY:
+    sc.model_check_only = True
+    sim.AddModelToTask('record', sc.terrain, ModelPriority=5)
+    sc.vizard_terrain = prepare_vizard_terrain(
+        Path(__file__).resolve().parent / 'Environment' / 'Objects' / OBJ_NAME,
+        Path(__file__).resolve().parent / 'work' / 'vizard_terrain',
+        grid_cells=VIZ_TERRAIN_GRID_CELLS)
+    sc.vizard_terrain_offset = centered_terrain_offset(
+        sc.vizard_terrain, TerrainFrame.TERRAIN_ROTATION_VIZARD, TerrainFrame.TERRAIN_SCALE)
+
 if not MODEL_CHECK_ONLY:
     # The planner and navigation adapter use the same compiled terrain as contacts.
-    sc.terrain = Env.create_terrain_spacecraft()
     SM = SensorsManager(sc, sampling_ns)
     sc.initialize_sensors(SM, samp, LOW_FIDELITY_SURFACE)
     SM.altimeter.debug_contact_every_n_steps = CONTACT_LOG_EVERY_N_STEPS
@@ -182,10 +195,13 @@ for name, (location, direction) in RCS_LAYOUT.items():
     )
 if MODEL_CHECK_ONLY:
     sc.initialize_thrusters(engines, tuple(engines))  # all main/RCS engines at rated thrust
-    sc.lander.hub.r_CN_NInit = [0., -(Dynamics.r_moon + 100000.), 0.]
+    sc.lander.hub.r_CN_NInit = preview_position(
+        sc.vizard_terrain, TerrainFrame.TERRAIN_POSITION_BSK,
+        TerrainFrame.TERRAIN_ROTATION_VIZARD, TerrainFrame.TERRAIN_SCALE,
+        clearance_m=MODEL_CHECK_CLEARANCE_M, offset=sc.vizard_terrain_offset)
     sc.lander.hub.v_CN_NInit = [0., 0., 0.]
     print(f"Model check: {runtime:g} seconds, all {len(engines)} thrusters ON, "
-          "100 km above the Moon. Descent planning and sensors skipped.", flush=True)
+          f"{MODEL_CHECK_CLEARANCE_M:g} m above the rendered terrain. Descent planning and sensors skipped.", flush=True)
 elif PROPULSION_MODE == "constant":
     sc.initialize_thrusters(engines, CONSTANT_ON_ENGINES)
 elif PROPULSION_MODE == "a2g":
@@ -228,21 +244,17 @@ elif PROPULSION_MODE == "a2g":
         controller = sc.initialize_descent(engines, descent_settings, descent_target)
     except (InfeasibleDescent, DescentSearchLimit) as exc:
         raise SystemExit(f"A2G planning stopped: {exc}\n"
-                         "See Spacecraft/Thrusters/DESCENT.md for example-orbit settings and validation limits.") from None
+                         "See Spacecraft/GNC/README.md for example-orbit settings and validation limits.") from None
     simulation_initial_state = prepare_powered_descent_start(sc) if START_AT_POWERED_DESCENT else doi_state
     if START_AT_POWERED_DESCENT:
         print(f"Starting native simulation at powered-descent ignition, t={simulation_start_s:g} s. "
               "Unpowered coast skipped; sensors initialize at the ignition state.", flush=True)
     navigation = TerrainNavigation(simulation_initial_state, sc.terrain_map, sc.lander.scStateOutMsg,
-        sc.imus['IMU'], sc.star_trackers['ST'], SM.altimeter, descent_settings.mu, NAVIGATION_SETTINGS)
+        sc.imus['IMU'], sc.star_trackers['ST'], SM.altimeter, descent_settings.mu, NAVIGATION_SETTINGS, sensor_period_s=samp)
     print(f"Navigation filter: {'UKF enabled' if ENABLE_NAVIGATION_FILTER else 'OFF — raw fixes / inertial propagation'}; "
           f"laser acceptance limit {NAVIGATION_SETTINGS.max_range_m:g} m. "
           "Z is predicted whenever no laser measurement is accepted.", flush=True)
     navigation.command_source = controller
-    attitude_navigation = AttitudeNavigation(simulation_initial_state.dcm_NB, sc.imus['IMU'], sc.star_trackers['ST'], samp)
-    navigation.attitude_navigation = attitude_navigation
-    sc.attitude_navigation = controller.attitude_navigation = attitude_navigation
-    sim.AddModelToTask('record', attitude_navigation, ModelPriority=-1)
     sc.navigation = controller.navigation = navigation
     controller.contact_sensor = SM.altimeter
     sim.AddModelToTask('record', navigation, ModelPriority=-2)
@@ -257,7 +269,7 @@ else:
 #Gravity Model
 
 Dynamics.initialize_dynamics(sim, sc, DISABLE_GRAVITY,
-                             CLOSE=False if MODEL_CHECK_ONLY else CLOSE_TO_LUNAR_SURFACE,
+                             CLOSE=CLOSE_TO_LUNAR_SURFACE,
                              LUNAR_ONLY=(MODEL_CHECK_ONLY or PROPULSION_MODE == "a2g"))
 if not MODEL_CHECK_ONLY and PROPULSION_MODE == "constant":
     Dynamics.initialize_vehicle_dynamics_parameters(sc, orbital_parameters, spacecraft_velocity_override, spacecraft_position_override)
@@ -273,7 +285,8 @@ model_check_file = Path(__file__).resolve().parent / '_VizFiles' / 'ModelCheck_U
 if MODEL_CHECK_ONLY:
     model_check_file.parent.mkdir(parents=True, exist_ok=True)
 initialize_vizard(sim, sc, task_name="viz",
-                  save_file=str(model_check_file) if MODEL_CHECK_ONLY else None)
+                  save_file=str(model_check_file) if MODEL_CHECK_ONLY else None,
+                  terrain_grid_cells=VIZ_TERRAIN_GRID_CELLS, model_grid_cells=VIZ_MODEL_GRID_CELLS)
 
 
 # Run simulation
@@ -291,7 +304,7 @@ if PROPULSION_MODE == "a2g":
     print("Descent result:", controller.status)
     if controller.history:
         print("Terminal guidance telemetry:", controller.history[-1])
-    from Spacecraft.Thrusters.DescentDiagnostics import save_descent_report
+    from Spacecraft.GNC.Control import save_descent_report
     save_descent_report(sc, Path(__file__).resolve().parent / 'results')
 
 #vvvvvv everything else is just diagnostics and plotting below vvvvvv

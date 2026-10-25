@@ -38,8 +38,7 @@ class RCS_thruster:
 
         self.thruster.addThruster(config)
 
-        # addThruster retains this shared config. Keeping it also works in
-        # Basilisk 2.10.2, whose thrusterData vector is not Python-indexable.
+        # addThruster retains this shared config. Keeping it also works in Basilisk 2.10.2, whose thrusterData vector is not Python-indexable.
         self.config = config
 
     def attach(self, spacecraft, simulation, task_name, priority=10):
@@ -63,13 +62,7 @@ class MainEngine(RCS_thruster):
     The thrust application point remains fixed.
     """
 
-    def __init__(
-        self,
-        config,
-        name="MainEngine",
-        location=None,
-        max_gimbal=0.27,
-    ):
+    def __init__(self,config,name="MainEngine",location=None,max_gimbal=0.27,):
         super().__init__(config, name=name, location=location)
 
         # Optional symmetric limit on each axis, in radians.

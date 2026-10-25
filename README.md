@@ -14,3 +14,6 @@ Upcoming Features:
   Fault Detection, Isolation and Recovery (FDIR)
   Machine Learning based FDIR (ML-FDIR)
   Increase accuracy to approach as close as possible to real lunar descent trajectories and circumstances
+
+
+Guidance, navigation and actuator commands are consolidated in `Spacecraft/GNC`. See [GNC documentation](Spacecraft/GNC/README.md).

@@ -1,5 +1,7 @@
-mujoco~=3.12.0
+mujoco==3.12.0
 numpy~=2.2.6
 scipy~=1.16.3
 matplotlib~=3.10.7
 astroquery~=0.4.11
+bsk==2.10.2
+pytest~=9.1.1

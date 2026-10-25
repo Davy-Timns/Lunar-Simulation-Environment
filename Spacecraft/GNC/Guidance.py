@@ -1,5 +1,5 @@
 """
-Classical Apollo guidance, bounded allocation, and flight-time search.
+Classical Apollo guidance, descent setup and constrained flight-time search.
 
 The historical identifier 'a2g' denotes the supplied fixed 12/6-gain law.
 This is not the complete Augmented Apollo Powered Descent Guidance (A2PDG)
@@ -10,11 +10,11 @@ All translational states use a Moon-centered INERTIAL frame, metres/seconds/kg.
 The planner minimizes fuel within this feedback-law family, not over arbitrary
 thrust histories. Feasibility is numerical and checked again on a finer grid.
 """
-from dataclasses import dataclass
 import time
 
+from Basilisk.utilities import RigidBodyKinematics
 import numpy as np
-from scipy.optimize import lsq_linear, minimize
+from scipy.optimize import minimize
 from scipy.integrate import solve_ivp
 from scipy.spatial.transform import Rotation
 
@@ -50,8 +50,6 @@ def a2g_acceleration(position, velocity, target_position, target_velocity,
             - 6 * (vector3(target_velocity) + vector3(velocity)) / time_to_go
             + vector3(target_acceleration) - gravity(position, mu))
 
-
-@dataclass
 class LandingTarget:
     """Constant inertial target, or a site rotating uniformly about the Moon.
 
@@ -60,19 +58,19 @@ class LandingTarget:
     With nonzero omega_N, do not also provide velocity/acceleration: these are
     computed from rotation. This does not introduce a rotating dynamics frame.
     """
-    position: object
-    velocity: object = (0, 0, 0)
-    acceleration: object = (0, 0, 0)
-    omega_N: object = (0, 0, 0)
-    epoch_s: float = 0.0
-
-    def __post_init__(self):
+    def __init__(self,position,velocity=(0, 0, 0), acceleration=(0, 0, 0), omega_N=(0, 0, 0),epoch_s=0.0):
+        self.position = position
+        self.velocity = velocity
+        self.acceleration = acceleration
+        self.omega_N = omega_N
+        self.epoch_s = epoch_s
         for name in ("position", "velocity", "acceleration", "omega_N"):
             setattr(self, name, vector3(getattr(self, name)))
         if not np.isfinite(self.epoch_s):
             raise ValueError("Target epoch must be finite.")
         if np.linalg.norm(self.omega_N) and (np.any(self.velocity) or np.any(self.acceleration)):
             raise ValueError("A rotating site derives its velocity and acceleration from omega_N.")
+
 
     def state(self, time_s):
         dt = time_s - self.epoch_s
@@ -83,36 +81,59 @@ class LandingTarget:
         return (self.position + dt * self.velocity + 0.5 * dt**2 * self.acceleration,
                 self.velocity + dt * self.acceleration, self.acceleration.copy())
 
-
-@dataclass
 class DescentSettings:
-    mu: float
-    dry_mass: float
-    min_thrust: float
-    max_thrust: float
-    tf_min: float
-    tf_max: float
-    position_tolerance: float = 0.5
-    velocity_tolerance: float = 0.1
-    surface_radius: float = 1737400.0
-    surface_tolerance_m: float = 0.01
-    terminal_guard_s: float = 0.5
-    attitude_frequency: float = 0.6
-    attitude_damping: float = 1.0
-    force_tracking_weight: float = 0.001
-    search_samples: int = 17
-    max_search_evaluations: int = 60
-    max_search_wall_s: float = 180.0
-    print_progress: bool = True
-    rollout_step_s: float = 0.2
-    coast_duration_s: float = 0.0
-    terminal_gate_height_m: float = 0.0  # 0 preserves single-endpoint examples
-    terminal_duration_s: float = 120.0
-    terrain_clearance_m: float = 20.0
-    landing_com_clearance_m: float = 0.66  # physical foot depth; contact margin stops thrust earlier
-    engine_cutoff_m: float = 0.0  # powered endpoint above lowest foot; 0 preserves surface endpoint
-
-    def __post_init__(self):
+    def __init__(self,
+                 mu,
+                 dry_mass,
+                 min_thrust,
+                 max_thrust,
+                 tf_min,
+                 tf_max,
+                 position_tolerance=0.5,
+                 velocity_tolerance=0.1,
+                 surface_radius=1737400.0,
+                 surface_tolerance_m=0.01,
+                 terminal_guard_s=0.5,
+                 attitude_frequency=0.6,
+                 attitude_damping=1.0,
+                 force_tracking_weight=0.001,
+                 search_samples=17,
+                 max_search_evaluations=60,
+                 max_search_wall_s=180.0,
+                 print_progress=True,
+                 rollout_step_s=0.2,
+                 coast_duration_s=0.0,
+                 terminal_gate_height_m=0.0,
+                 terminal_duration_s=120.0,
+                 terrain_clearance_m=20.0,
+                 landing_com_clearance_m=0.66,
+                 engine_cutoff_m=0.0,
+                 ):
+        self.mu = mu
+        self.dry_mass = dry_mass
+        self.min_thrust = min_thrust
+        self.max_thrust = max_thrust
+        self.tf_min = tf_min
+        self.tf_max = tf_max
+        self.position_tolerance = position_tolerance
+        self.velocity_tolerance = velocity_tolerance
+        self.surface_radius = surface_radius
+        self.surface_tolerance_m = surface_tolerance_m
+        self.terminal_guard_s = terminal_guard_s
+        self.attitude_frequency = attitude_frequency
+        self.attitude_damping = attitude_damping
+        self.force_tracking_weight = force_tracking_weight
+        self.search_samples = search_samples
+        self.max_search_evaluations = max_search_evaluations
+        self.max_search_wall_s = max_search_wall_s
+        self.print_progress = print_progress
+        self.rollout_step_s = rollout_step_s
+        self.coast_duration_s = coast_duration_s
+        self.terminal_gate_height_m = terminal_gate_height_m
+        self.terminal_duration_s = terminal_duration_s
+        self.terrain_clearance_m = terrain_clearance_m
+        self.landing_com_clearance_m = landing_com_clearance_m
+        self.engine_cutoff_m = engine_cutoff_m
         numeric = [v for v in vars(self).values()]
         if not np.all(np.isfinite(numeric)):
             raise ValueError("Descent settings must be finite.")
@@ -138,15 +159,13 @@ class DescentSettings:
             raise ValueError('Terminal duration must be shorter than total powered flight time')
 
 
-@dataclass
 class DescentState:
-    position: np.ndarray
-    velocity: np.ndarray
-    mass: float
-    dcm_NB: np.ndarray
-    omega_B: np.ndarray
-
-    def __post_init__(self):
+    def __init__(self, position, velocity, mass, dcm_NB, omega_B):
+        self.position = position
+        self.velocity = velocity
+        self.mass = mass
+        self.dcm_NB = dcm_NB
+        self.omega_B = omega_B
         self.position = vector3(self.position).copy()
         self.velocity = vector3(self.velocity).copy()
         self.omega_B = vector3(self.omega_B).copy()
@@ -158,23 +177,10 @@ class DescentState:
                 not np.isclose(np.linalg.det(self.dcm_NB), 1.)):
             raise ValueError("dcm_NB must be a proper orthogonal rotation.")
 
+
     def copy(self):
         return DescentState(self.position.copy(), self.velocity.copy(), float(self.mass),
                             self.dcm_NB.copy(), self.omega_B.copy())
-
-
-@dataclass
-class ActuatorCommand:
-    main_thrust: float
-    pitch: float
-    yaw: float
-    rcs_thrusts: np.ndarray
-    force_B: np.ndarray
-    torque_B: np.ndarray
-    mass_flow: float
-    requested_force_N: np.ndarray
-    saturated: bool
-
 
 def coast_state(initial, duration_s, mu, surface_radius=0.):
     """Propagate the post-DOI unpowered coast in the same inertial gravity model.
@@ -207,124 +213,35 @@ def coast_state(initial, duration_s, mu, surface_radius=0.):
     return state
 
 
-class DescentAllocator:
-    """Attitude PD plus constrained gimbal/RCS allocation.
-
-    Main gimbal lateral-force columns are linearized for allocation, then
-    converted to actual limited angles. Propagation uses the resulting REAL
-    force and moment. RCS levels represent averaged duty-cycle thrust.
-    """
-    def __init__(self, main_engine, rcs_engines, inertia_B, settings):
-        self.settings = settings
-        self.inertia = np.asarray(inertia_B, dtype=float).reshape(3, 3)
-        if (not np.all(np.isfinite(self.inertia)) or
-                not np.allclose(self.inertia, self.inertia.T) or
-                np.min(np.linalg.eigvalsh(self.inertia)) <= 0):
-            raise ValueError("Inertia must be finite, symmetric and positive definite.")
-        self.inv_inertia = np.linalg.inv(self.inertia)
-        self.mount = main_engine._mount_dcm_BM.copy()
-        self.location = vector3(main_engine.config.thrLoc_B)
-        self.limit = main_engine.max_gimbal
-        if self.limit is None or not 0 < self.limit < np.pi / 2:
-            raise ValueError("Descent requires a finite gimbal limit between 0 and pi/2.")
-        if settings.max_thrust > main_engine.config.MaxThrust:
-            raise ValueError("Descent Tmax exceeds the configured main-engine rating.")
-        self.main_isp = float(main_engine.config.steadyIsp)
-        self.rcs_names = list(rcs_engines)
-        self.rcs_max = np.array([e.config.MaxThrust for e in rcs_engines.values()])
-        self.rcs_isp = np.array([e.config.steadyIsp for e in rcs_engines.values()])
-        self.directions = np.array([vector3(e.config.thrDir_B) for e in rcs_engines.values()]).reshape(-1, 3).T
-        self.moments = np.array([np.cross(vector3(e.config.thrLoc_B), vector3(e.config.thrDir_B))
-                                 for e in rcs_engines.values()]).reshape(-1, 3).T
-        if self.main_isp <= 0 or np.any(self.rcs_isp <= 0) or np.any(self.rcs_max <= 0):
-            raise ValueError("Engine ratings and Isp must be positive.")
-        self.force_columns = np.column_stack((self.mount[:, 1:], self.directions))
-        self.torque_columns = np.column_stack((
-            np.cross(self.location, self.mount[:, 1]),
-            np.cross(self.location, self.mount[:, 2]), self.moments))
-        self.allocation_matrix = np.vstack((self.torque_columns,settings.force_tracking_weight * self.force_columns))
-        wrenches = np.vstack((self.directions, self.moments))
-        self.opposed_rcs_pairs = [(i, j) for i in range(len(self.rcs_max))
-                                  for j in range(i + 1, len(self.rcs_max))
-                                  if np.allclose(wrenches[:, i], -wrenches[:, j], rtol=0, atol=1e-12)]
-
-    def cancel_opposed_rcs(self, levels):
-        """Remove equal/opposite firings without changing force or torque."""
-        levels = np.asarray(levels, dtype=float).copy()
-        for i, j in self.opposed_rcs_pairs:
-            cancelled = min(levels[i], levels[j])
-            levels[i] -= cancelled
-            levels[j] -= cancelled
-        return levels
-
-    def command(self, state, target_state, time_to_go, *, main_enabled=True):
-        cfg = self.settings
-        acceleration = a2g_acceleration(state.position, state.velocity, *target_state, max(time_to_go, cfg.terminal_guard_s), cfg.mu)
-        requested = state.mass * acceleration
-        requested_B = state.dcm_NB.T @ requested
-        magnitude = np.linalg.norm(requested_B)
-        # The engine can push only along its current axis. Using ||T_requested||
-        # turns a downward/sideways correction into upward thrust when terminal
-        # attitude is upright. Project onto the realizable axis instead.
-        nominal_axis = self.mount[:, 0]
-        axial_request = float(np.dot(requested_B, nominal_axis))
-        thrust = float(np.clip(axial_request, cfg.min_thrust, cfg.max_thrust)) if main_enabled else 0.0
-        desired_axis = requested_B / magnitude if magnitude > 1e-12 else self.mount[:, 0]
-        # Attitude must track the translational force reference through approach.
-        # A clock-only blend to vertical discards needed braking/position control;
-        # the body becomes upright naturally when the required force is vertical.
-        # Phase times label telemetry; a separate staged trajectory is required
-        # to prescribe a particular pitchover maneuver or terminal descent rate.
-        axis = np.cross(nominal_axis, desired_axis)
-        sine = np.linalg.norm(axis)
-        cosine = np.clip(np.dot(nominal_axis, desired_axis), -1, 1)
-        error = (axis * np.arctan2(sine, cosine) / sine if sine > 1e-10 else
-                 (self.mount[:, 1] * np.pi if cosine < 0 else np.zeros(3)))
-        # The roll degree of freedom is damped, without prescribing an arbitrary roll attitude.
-        torque = self.inertia @ (cfg.attitude_frequency**2 * error - 2 * cfg.attitude_damping * cfg.attitude_frequency * state.omega_B)
-        torque += np.cross(state.omega_B, self.inertia @ state.omega_B)
-        nominal_force = thrust * nominal_axis
-        rhs = np.concatenate((torque - np.cross(self.location, nominal_force),
-                              cfg.force_tracking_weight * (requested_B - nominal_force)))
-        # Tiny nonzero bounds keep scipy's strictly ordered bounds valid while off.
-        lateral_limit = max(thrust * np.tan(self.limit), 1e-12)
-        lower = np.concatenate(([-lateral_limit] * 2, np.zeros(len(self.rcs_max))))
-        upper = np.concatenate(([lateral_limit] * 2, self.rcs_max))
-        solution = lsq_linear(self.allocation_matrix, rhs, bounds=(lower, upper),
-                              method="bvls", tol=1e-8, max_iter=30)
-        if not solution.success:
-            raise RuntimeError("Gimbal/RCS allocation did not converge.")
-        local = np.array([thrust, solution.x[0], solution.x[1]])
-        norm = np.linalg.norm(local)
-        local = local / norm if norm > 1e-12 else np.array([1., 0., 0.])
-        pitch = float(np.clip(-np.arcsin(np.clip(local[2], -1, 1)), -self.limit, self.limit))
-        yaw = float(np.clip(np.arctan2(local[1], local[0]), -self.limit, self.limit))
-        actual_direction = self.mount @ np.array([np.cos(pitch) * np.cos(yaw),
-                                                  np.cos(pitch) * np.sin(yaw), -np.sin(pitch)])
-        main_force = thrust * actual_direction
-        rcs = self.cancel_opposed_rcs(np.clip(solution.x[2:], 0, self.rcs_max))
-        force = main_force + self.directions @ rcs
-        moment = np.cross(self.location, main_force) + self.moments @ rcs
-        flow = thrust / (self.main_isp * G0) + np.sum(rcs / (self.rcs_isp * G0))
-        return ActuatorCommand(thrust, pitch, yaw, rcs, force, moment, float(flow), requested,
-                               bool(main_enabled and (axial_request > cfg.max_thrust or axial_request < cfg.min_thrust)))
-
-
-@dataclass
 class TrajectoryResult:
-    flight_time: float
-    fuel_used: float
-    position_error: float
-    velocity_error: float
-    min_radius: float
-    final_mass: float
-    feasible: bool
-    state: DescentState
-    stop_reason: str = "touchdown_time"
-    elapsed_s: float = 0.0
-    peak_requested_thrust: float = 0.0
-    saturated_s: float = 0.0
-    path_violation_m: float = 0.0
+    def __init__(self,
+                 flight_time,
+                 fuel_used,
+                 position_error,
+                 velocity_error,
+                 min_radius,
+                 final_mass,
+                 feasible,
+                 state,
+                 stop_reason='touchdown_time',
+                 elapsed_s=0.0,
+                 peak_requested_thrust=0.0,
+                 saturated_s=0.0,
+                 path_violation_m=0.0,
+                 ):
+        self.flight_time = flight_time
+        self.fuel_used = fuel_used
+        self.position_error = position_error
+        self.velocity_error = velocity_error
+        self.min_radius = min_radius
+        self.final_mass = final_mass
+        self.feasible = feasible
+        self.state = state
+        self.stop_reason = stop_reason
+        self.elapsed_s = elapsed_s
+        self.peak_requested_thrust = peak_requested_thrust
+        self.saturated_s = saturated_s
+        self.path_violation_m = path_violation_m
 
 
 class InfeasibleDescent(ValueError):
@@ -346,7 +263,13 @@ class _RefinementLimit(RuntimeError):
     pass
 
 
-class FlightTimePlanner:
+class Guidance:
+    """A2G law, phased targets, propagation and constrained flight-time planning."""
+
+    a2g_acceleration = staticmethod(a2g_acceleration)
+    gravity = staticmethod(gravity)
+    coast_state = staticmethod(coast_state)
+
     def __init__(self, allocator, target, terrain_map=None, landing_foot_points_B=None):
         self.allocator = allocator
         self.settings = allocator.settings
@@ -681,3 +604,81 @@ class FlightTimePlanner:
             f"Stop reason: {best.stop_reason} at {best.elapsed_s:.1f} s of {best.flight_time:.1f} s. "
             "Check initial conditions, target, fuel, thrust/attitude authority and time bounds."
         )
+
+
+def example_post_doi_state(settings, target, wet_mass, pdi_altitude=15000., apolune_altitude=100000., approach_angle_deg=21.0):
+    """Illustrative polar ellipse, NOT reconstructed Apollo/IM navigation data.
+
+    Construct the PDI state at perilune, upstream of the requested south-pole
+    target, then propagate backwards through the specified post-DOI coast.
+    """
+    touchdown = settings.coast_duration_s + 0.5 * (settings.tf_min + settings.tf_max)
+    target_state = target.state(touchdown)
+    normal = target_state[0] / np.linalg.norm(target_state[0])
+    tangent = np.array([0., 0., 1.])
+    tangent -= np.dot(tangent, normal) * normal
+    if np.linalg.norm(tangent) < 1e-8:
+        tangent = np.array([1., 0., 0.])
+        tangent -= np.dot(tangent, normal) * normal
+    tangent /= np.linalg.norm(tangent)
+    angle = np.deg2rad(approach_angle_deg)
+    pdi_normal = np.cos(angle) * normal - np.sin(angle) * tangent
+    pdi_tangent = np.sin(angle) * normal + np.cos(angle) * tangent
+    rp = settings.surface_radius + pdi_altitude
+    ra = settings.surface_radius + apolune_altitude
+    if rp <= settings.surface_radius or ra < rp:
+        raise ValueError("Example orbit requires 0 < perilune altitude <= apolune altitude.")
+    speed = np.sqrt(settings.mu * (2 / rp - 2 / (rp + ra)))
+    pdi = DescentState(rp * pdi_normal, speed * pdi_tangent, wet_mass, np.eye(3), np.zeros(3))
+    thrust_axis = a2g_acceleration(pdi.position, pdi.velocity, *target_state,
+                                   touchdown - settings.coast_duration_s, settings.mu)
+    z_axis = thrust_axis / np.linalg.norm(thrust_axis)
+    y_axis = np.array([1., 0., 0.])
+    y_axis -= np.dot(y_axis, z_axis) * z_axis
+    y_axis /= np.linalg.norm(y_axis)
+    pdi.dcm_NB = np.column_stack((np.cross(y_axis, z_axis), y_axis, z_axis))
+    return coast_state(pdi, -settings.coast_duration_s, settings.mu, settings.surface_radius)
+
+
+def apply_initial_state(vehicle, state):
+    vehicle.lander.hub.r_CN_NInit = state.position.tolist()
+    vehicle.lander.hub.v_CN_NInit = state.velocity.tolist()
+    vehicle.lander.hub.sigma_BNInit = RigidBodyKinematics.C2MRP(state.dcm_NB.T).tolist()
+    vehicle.lander.hub.omega_BN_BInit = state.omega_B.tolist()
+
+
+def prepare_powered_descent_start(vehicle):
+    """Initialize the hub at PDI, skipping native propagation of the coast.
+
+    Fuel is unchanged during coast. Preserve the original mission/ignition
+    epochs, and initialize sensor navigation separately from the returned state.
+    """
+    controller = vehicle.thruster_controller
+    cfg = controller.settings
+    vehicle.simulation_start_s = float(cfg.coast_duration_s)
+    state = controller.pdi_state.copy()
+    apply_initial_state(vehicle, state)
+    controller.mission_start_s = 0.0
+    return state
+
+
+def initialize_simulation_at(sim, start_ns=0):
+    """Initialize each Basilisk model once at the requested mission clock.
+
+    Tasks must be created with FirstStart=start_ns. Resetting the hub at that
+    same epoch prevents integrating the skipped interval on its first update.
+    """
+    if not start_ns:
+        sim.InitializeSimulation()
+        return
+    if sim.simulationInitialized:
+        raise ValueError("A late start requires a new simulation.")
+    sim.TotalSim.assignRemainingProcs()
+    sim.TotalSim.ResetSimulation()
+    sim.TotalSim.selfInitSimulation()
+    for task in sim.TaskList:
+        task.resetTask(start_ns)
+    sim.TotalSim.CurrentNanos = start_ns
+    sim.simulationInitialized = True
+
+

@@ -7,6 +7,7 @@ import Spacecraft.Mujoco.FrameTransforms as TerrainFrame
 from Basilisk.simulation import vizInterface
 from Basilisk.utilities import macros
 from Spacecraft.Mujoco.MujocoPhysicsEngine import OBJ_NAME
+from Environment.VizardTerrain import prepare_vizard_terrain, prepare_vizard_model, centered_terrain_offset
 
 class _ThrusterVizTelemetry(sysModel.SysModel):
     """Keep hardware ratings constant in visualization while actual thrust varies."""
@@ -36,12 +37,15 @@ class _ThrusterVizTelemetry(sysModel.SysModel):
 
 
 
-def initialize_vizard(sim, sc, task_name="record", save_file=None):
+def initialize_vizard(sim, sc, task_name="record", save_file=None, terrain_grid_cells=180, model_grid_cells=32):
 
     if vizSupport.vizFound:
         model_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "Spacecraft", "IM1.obj"))
         if not os.path.isfile(model_path):
             raise FileNotFoundError(f"Vizard spacecraft model not found: {model_path}")
+        model_path = prepare_vizard_model(
+            model_path, os.path.join(os.path.dirname(__file__), 'work', 'vizard_models'),
+            grid_cells=model_grid_cells).path
 
         # =========================================================
         # IMX LIGHT
@@ -163,13 +167,26 @@ def initialize_vizard(sim, sc, task_name="record", save_file=None):
             terrain_map = getattr(sc, "terrain_map", None)
             if terrain_map is not None:
                 terrain_path = terrain_map.export_vizard_obj(os.path.join(
-                    os.path.dirname(__file__), "work", "terrain_collision_aligned.obj"))
+                    os.path.dirname(__file__), "work", "terrain_collision_aligned.obj"), versioned=True)
+
+            display = getattr(sc, 'vizard_terrain', None)
+            if display is None or terrain_map is not None:
+                display = prepare_vizard_terrain(
+                    terrain_path, os.path.join(os.path.dirname(__file__), 'work', 'vizard_terrain'),
+                    grid_cells=terrain_grid_cells, surface_sign=-1 if terrain_map is not None else 1)
+                sc.vizard_terrain = display
+            terrain_path = display.path
+            # Collision exports already contain the centered world positions.
+            # Raw OBJ previews require the shared source-corner correction.
+            terrain_offset = ([0., 0., 0.] if terrain_map is not None else
+                              centered_terrain_offset(display, TerrainFrame.TERRAIN_ROTATION_VIZARD,
+                                                      TerrainFrame.TERRAIN_SCALE))
 
             vizSupport.createCustomModel(
                 viz,
                 terrain_path,
                 simBodiesToModify=[terrain.ModelTag],
-                offset=[0.0, 0.0, 0.0],
+                offset=terrain_offset,
                 rotation=[0.,0.,0.] if terrain_map is not None else TerrainFrame.TERRAIN_ROTATION_VIZARD,
                 scale=[1.,1.,1.] if terrain_map is not None else TerrainFrame.TERRAIN_SCALE
             )
@@ -178,6 +195,15 @@ def initialize_vizard(sim, sc, task_name="record", save_file=None):
         # CAMERA SETTINGS
         # =========================================================
         viz.settings.forceStartAtSpacecraftLocalView = 1
+        viz.settings.mainCameraTarget = sc.lander.ModelTag
+
+        if getattr(sc, 'model_check_only', False):
+            # Body +Z is lunar outward/up in the preview; -Z looks at the
+            # terrain, with the camera below the lander to avoid CAD occlusion.
+            vizSupport.createStandardCamera(
+                viz, spacecraftName=sc.lander.ModelTag, setMode=1,
+                pointingVector_B=[0., 0., -1.], position_B=[15., 0., -3.],
+                fieldOfView=60. * macros.D2R, displayName='Terrain below IMX')
 
         viz.settings.scViewToPlanetViewBoundaryMultiplier = 10
         viz.settings.planetViewToHelioViewBoundaryMultiplier = 10

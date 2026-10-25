@@ -1,7 +1,7 @@
 from Basilisk.utilities import SimulationBaseClass, macros, vizSupport, unitTestSupport
 from Basilisk.simulation import spacecraft, extForceTorque
 from Spacecraft.Mujoco import MujocoPhysicsEngine as MPE
-from Spacecraft.Thrusters.DummyController import DummyController
+from Spacecraft.GNC.Control import ConstantControl
 
 class Vehicle:
     def __init__(self, sim, name, sampling_ns, spacecraft_attitude_MRP, spacecraft_attitude_rate, spacecraft_mass, spacecraft_inertia):
@@ -45,7 +45,7 @@ class Vehicle:
             raise RuntimeError("Thrusters have already been initialized.")
         engines = dict(engines)
         if controller is None:
-            controller = DummyController(
+            controller = ConstantControl(
                 engines, self.sampling_ns * macros.NANO2SEC, enabled_engines
             )
         self.engines = engines
@@ -66,8 +66,8 @@ class Vehicle:
         import numpy as np
         from Basilisk.simulation import fuelTank
         from Basilisk.utilities import RigidBodyKinematics
-        from Spacecraft.Thrusters.DescentGuidance import DescentState
-        from Spacecraft.Thrusters.DescentController import DescentController
+        from Spacecraft.GNC.Guidance import DescentState
+        from Spacecraft.GNC.Control import Control
         if self.thruster_controller is not None:
             raise RuntimeError("Choose either dummy or descent propulsion before initialization.")
         wet_mass = float(self.lander.hub.mHub)
@@ -92,7 +92,7 @@ class Vehicle:
         tank.ModelTag = "DescentFuelTank"
         tank.setTankModel(tank_model)
         # Plan before modifying the spacecraft; infeasible setup raises here.
-        controller = DescentController(main, rcs, settings, target, initial,
+        controller = Control(main, rcs, settings, target, initial,
                                        self.lander.hub.IHubPntBc_B,
                                        self.sampling_ns * macros.NANO2SEC,
                                        self.lander.scStateOutMsg, tank.fuelTankOutMsg,
