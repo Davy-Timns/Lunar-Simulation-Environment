@@ -2,7 +2,6 @@ import mujoco
 import numpy as np
 from pathlib import Path
 import time
-from Environment.CollisionTerrain import prepare_collision_terrain
 from Sensors.Laser.Altimeter import LaserAltimeter
 from Spacecraft.Mujoco.FrameTransforms import (
     TERRAIN_POSITION_MUJOCO,
@@ -167,36 +166,137 @@ def _spacecraft_collision_geoms_xml(margin):
 """
 
 
-def initialize_mujoco(LF:int,scm,sci,samp):
+def initialize_mujoco(LF: int, scm, sci, samp):
+    import hashlib
+    import json
+    import tempfile
+    from types import SimpleNamespace
+    from Environment.VizardTerrain import (
+        prepare_vizard_terrain,
+        read_display_mesh,
+        centered_terrain_offset,
+        display_transform,
+    )
+    from Spacecraft.Mujoco import FrameTransforms as frames
+
     started = time.monotonic()
     terrain = None
     assets = {}
+
     if LF == 0:
-        # Sphere-only mode does not require an OBJ at all.
         XML = get_xml(LF)
     else:
         root = Path(__file__).resolve().parents[2]
-        terrain = prepare_collision_terrain(
-            root / 'Environment' / 'Objects' / OBJ_NAME,
-            root / 'work' / 'collision_terrain', root / 'work' / 'vizard_terrain',
-            grid_cells=COLLISION_TERRAIN_GRID_CELLS)
-        path = Path(terrain.path)
-        print(f'MuJoCo terrain: {terrain.vertices:,} vertices / {terrain.triangles:,} triangles; '
-              f'approximate DEM cell {terrain.approximate_cell_m:.2f} m; {path.stat().st_size / 1024**2:.1f} MiB. '
-              'Compiling bounded collision geometry...', flush=True)
-        XML = get_xml(LF, terrain_file=path.name, terrain_scale=[1., 1., 1.], terrain_rotation=[0., 0., 0.])
-        assets[path.name] = path.read_bytes()  # only the bounded mesh, never the original OBJ
+        print("MuJoCo: preparing collision terrain...", flush=True)
+
+        display = prepare_vizard_terrain(
+            root / "Environment" / "Objects" / OBJ_NAME,
+            root / "work" / "vizard_terrain",
+            grid_cells=COLLISION_TERRAIN_GRID_CELLS,
+        )
+        vertices, faces = read_display_mesh(display.path)
+        offset = centered_terrain_offset(
+            display,
+            frames.TERRAIN_ROTATION_VIZARD,
+            frames.TERRAIN_SCALE,
+        )
+
+        # Apply the same transform used by Vizard, then convert to MuJoCo.
+        local_N = display_transform(
+            vertices,
+            [0., 0., 0.],
+            frames.TERRAIN_ROTATION_VIZARD,
+            frames.TERRAIN_SCALE,
+            offset,
+        )
+        local_M = local_N @ frames.R_BSK_TO_MUJOCO.T
+        faces = faces[:, [0, 2, 1]]  # Correct winding after reflection.
+
+        source = Path(display.path).resolve()
+        stat = source.stat()
+        signature = {
+            "version": 3,
+            "source": str(source),
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "grid_cells": COLLISION_TERRAIN_GRID_CELLS,
+            "rotation": list(frames.TERRAIN_ROTATION_VIZARD),
+            "scale": list(frames.TERRAIN_SCALE),
+            "offset": offset,
+        }
+        key = hashlib.sha256(
+            json.dumps(signature, sort_keys=True).encode()
+        ).hexdigest()[:16]
+
+        cache_dir = root / "work" / "collision_terrain"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        path = cache_dir / f"{Path(OBJ_NAME).stem}_collision_{key}.obj"
+
+        if not path.is_file():
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="ascii",
+                    dir=cache_dir,
+                    suffix=".obj",
+                    delete=False,
+                ) as stream:
+                    temporary = Path(stream.name)
+                    stream.write("# Baked collision terrain; metres\n")
+                    np.savetxt(stream, local_M, fmt="v %.9f %.9f %.9f")
+                    np.savetxt(stream, faces + 1, fmt="f %d %d %d")
+
+                temporary.replace(path)
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+
+        cell_m = (
+            float(np.max(np.ptp(local_M, axis=0)))
+            / COLLISION_TERRAIN_GRID_CELLS
+            if display.optimized else 0.
+        )
+        terrain = SimpleNamespace(
+            path=str(path),
+            vertices=len(local_M),
+            triangles=len(faces),
+            approximate_cell_m=cell_m,
+        )
+
+        print(
+            f"MuJoCo terrain: {terrain.vertices:,} vertices / "
+            f"{terrain.triangles:,} triangles; approximate DEM cell "
+            f"{cell_m:.2f} m. Compiling collision geometry...",
+            flush=True,
+        )
+        XML = get_xml(
+            LF,
+            terrain_file=path.name,
+            terrain_scale=[1., 1., 1.],
+            terrain_rotation=[0., 0., 0.],
+        )
+        assets[path.name] = path.read_bytes()
+
     model = mujoco.MjModel.from_xml_string(XML, assets=assets)
 
+    print("MuJoCo: creating simulation data...", flush=True)
     data = mujoco.MjData(model)
 
-    laser_id = mujoco.mj_name2id(model,mujoco.mjtObj.mjOBJ_SITE,"laser_altimeter")
+    laser_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_SITE, "laser_altimeter"
+    )
+    if laser_id < 0:
+        raise ValueError("MuJoCo model has no laser_altimeter site.")
 
-    altimeter = LaserAltimeter(model,data,laser_id,scm,sci,samp)
+    altimeter = LaserAltimeter(model, data, laser_id, scm, sci, samp)
     altimeter.collision_terrain = terrain
-    print(f'MuJoCo geometry ready in {time.monotonic() - started:.2f}s; '
-          f'arena={model.narena / 1024**2:g} MiB', flush=True)
 
+    print(
+        f"MuJoCo geometry ready in {time.monotonic() - started:.2f}s; "
+        f"arena={model.narena / 1024**2:g} MiB",
+        flush=True,
+    )
     return altimeter
 
 
