@@ -11,6 +11,9 @@ from scipy.spatial.transform import Rotation
 from Basilisk.architecture import messaging, sysModel
 from Basilisk.utilities import RigidBodyKinematics
 from Spacecraft.Mujoco.FrameTransforms import R_MUJOCO_TO_BSK, TERRAIN_POSITION_BSK
+from Sensors.FaultInjection import FaultInjector
+from Sensors.Sensors import SharedSensorFaults
+
 
 MAP_TO_N = np.array([[1.,0.,0.], [0.,0.,-1.], [0.,1.,0.]])
 BSK_TO_UNITY = np.array([[0.,1.,0.], [0.,0.,1.], [-1.,0.,0.]])
@@ -323,7 +326,7 @@ class UKF:
         transport[9:12, 9:12] = self._right_jacobian(correction[9:12])
         self.P = self._positive(transport @ covariance @ transport.T)
 
-    def update(self, observation, observation_function, noise):
+    def update(self, observation, observation_function, noise, label=None):
         """Unscented update of all states, including translation/attitude coupling."""
         points = self.sigma_points()
         values = np.asarray(observation_function(*points), dtype=float)
@@ -336,6 +339,8 @@ class UKF:
         mean = values[0] + np.mean(values[1:] - values[0], axis=0)
         residuals = values - mean
         innovation = self._positive(self._covariance(residuals, residuals) + noise)
+        if getattr(self, "diagnostics", None) is not None:
+            self.diagnostics(label, observation-mean, innovation)
         cross = self._covariance(self._errors(points), residuals)
         gain = np.linalg.solve(innovation, cross.T).T
         self._apply(gain @ (observation - mean), self.P - gain @ innovation @ gain.T)
@@ -346,6 +351,8 @@ class UKF:
         noise = np.eye(3) * sigma**2
         gain = np.linalg.solve(self.P[12:, 12:] + noise, self.P[:, 12:].T).T
         residual = np.asarray(rate) - self.omega
+        if getattr(self, "diagnostics", None) is not None:
+            self.diagnostics("gyro", residual, self.P[12:,12:] + noise)
         ikh = np.eye(15)
         ikh[:, 12:] -= gain
         self._apply(gain @ residual, ikh @ self.P @ ikh.T + gain @ noise @ gain.T)
@@ -354,12 +361,12 @@ class UKF:
         reference = self.rotation.copy()
         measured = Rotation.from_matrix(reference.T @ rotation).as_rotvec()
         self.update(measured, lambda x, r, w: Rotation.from_matrix(reference.T @ r).as_rotvec(),
-                    np.eye(3) * sigma**2)
+                    np.eye(3) * sigma**2, label="star")
 
-    def update_acceleration(self, acceleration_B, sigma):
+    def update_acceleration(self, acceleration_B, sigma, label="accelerometer"):
         self.update(acceleration_B,
                     lambda x, r, w: np.einsum('nji,nj->ni', r, x[:, 6:9]),
-                    np.eye(3) * sigma**2)
+                    np.eye(3) * sigma**2, label=label)
 
 
 class TerrainNavigation(sysModel.SysModel):
@@ -370,7 +377,7 @@ class TerrainNavigation(sysModel.SysModel):
     prior is supplied by mission setup. Raw mode bypasses every Kalman update.
     """
     def __init__(self, initial, terrain, sc_state_msg, imu, star_tracker, altimeter,
-                 mu, settings=None, sensor_period_s=.01):
+                 mu, settings=None, sensor_period_s=.01, batch_config=None, total_run_fault_rate=0.5):
         super().__init__()
         self.cfg = settings or NavigationSettings()
         if not np.isfinite(sensor_period_s) or sensor_period_s <= 0:
@@ -394,12 +401,19 @@ class TerrainNavigation(sysModel.SysModel):
         self.attitudeOutMsg = messaging.NavAttMsg()
         self.ukf = UKF(initial, mu)
         self.command_source = None
+        self.batch_config = batch_config
+        seeds = batch_config.get("seeds", {}) if batch_config else {}
+        fault_options = batch_config.get("fault_options", {}) if batch_config else {}
+        self.fault_injector = FaultInjector(self.sensor_period_s, seed=seeds.get("fault_schedule"), runtime_seed=seeds.get("fault_runtime"), **fault_options, total_run_fault_rate=total_run_fault_rate)
+        self.data_recorder = None
+        self.shared_sensor_faults = SharedSensorFaults(imu, star_tracker, altimeter)
         self.Reset(0)
 
     def Reset(self, now):
         self.ukf.reset(self.initial)
-        self.noise = GaussMarkovXY(self.cfg.xy_sigma_m, self.cfg.xy_correlation_s, self.cfg.seed)
-        self.range_rng = np.random.default_rng(self.cfg.seed+1)
+        seeds = self.batch_config.get("seeds", {}) if self.batch_config else {}
+        self.noise = GaussMarkovXY(self.cfg.xy_sigma_m, self.cfg.xy_correlation_s, seeds.get("xy", self.cfg.seed))
+        self.range_rng = np.random.default_rng(seeds.get("range", self.cfg.seed+1))
         self.last_s = None
         self.last_fix_s = None
         self.last_star_ns = None
@@ -411,6 +425,15 @@ class TerrainNavigation(sysModel.SysModel):
         self.attitude_history = []
         self.previous_fix = None
         self._publish(now)
+        self.fi_tick = 0
+        self.fault_injector.reset_fault_state()
+        self.shared_sensor_faults.reset()
+        self.xy_measurement = np.full(2, np.nan)
+        self.xy_history = []
+        if self.batch_config:
+            from SimulationData import TickRecorder
+            self.data_recorder = TickRecorder(self.batch_config.get("full_covariance", False))
+            self.ukf.diagnostics = self.data_recorder.innovation
 
     def _publish(self, now):
         payload = messaging.NavTransMsgPayload()
@@ -427,7 +450,9 @@ class TerrainNavigation(sysModel.SysModel):
     def _star_rotation(self, t):
         if not self.star.isWritten() or self.star.timeWritten() == self.last_star_ns:
             return None
+
         q = np.asarray(self.star().qInrtl2Case)
+        
         if (t-self.star.timeWritten()*1e-9 > .2 or not np.isfinite(q).all()
                 or np.linalg.norm(q) < 1e-12):
             return None
@@ -459,11 +484,10 @@ class TerrainNavigation(sysModel.SysModel):
         return (positions[:, 2] + offsets[:, 2] + measured*directions[:, 2] - heights)[:, None]
 
     def _terrain_update(self, now, t, dt):
-        # Only these two authorized coordinates are read from the truth message.
-        xy = self.terrain.to_map(np.asarray(self.truth().r_BN_N))[:2] + self.noise.sample(dt)
+        xy = self.xy_measurement.copy()
         if self.cfg.filter_enabled:
             self.ukf.update(xy, lambda x, r, w: self.terrain.to_map(x[:, :3])[:, :2],
-                            np.eye(2)*(self.cfg.xy_sigma_m**2+1e-8))
+                            np.eye(2)*(self.cfg.xy_sigma_m**2+1e-8), label="xy")
         raw = self.altimeter.altitude
         c_NB = self.ukf.rotation
         down = float((MAP_TO_N.T @ c_NB @ self.laser_direction_B)[2])
@@ -480,7 +504,7 @@ class TerrainNavigation(sysModel.SysModel):
         measured = observed = np.nan
         predicted_z = self.terrain.to_map(self.ukf.translation[:3])[2]
         if valid:
-            measured = raw + self.range_rng.normal(0, self.cfg.range_sigma_m)
+            measured = raw
             observed = position_from_range(self.terrain, xy, measured, c_NB,
                                            self.laser_offset_B, self.laser_direction_B)
             if measured < 0:
@@ -493,7 +517,7 @@ class TerrainNavigation(sysModel.SysModel):
                     # rotates the beam and shifts its own terrain footprint;
                     # attitude uncertainty is propagated, not added twice to R.
                     self.ukf.update([0.], lambda x, r, w: self._range_residual(x, r, w, measured),
-                                    np.array([[self.cfg.range_sigma_m**2*down**2 + .05**2]]))
+                                    np.array([[self.cfg.range_sigma_m**2*down**2 + .05**2]]), label="range")
                 except LookupError:
                     valid, reason = False, 'footprint_unmapped'
         if not self.cfg.filter_enabled:
@@ -509,6 +533,8 @@ class TerrainNavigation(sysModel.SysModel):
             self.previous_fix = (position_M.copy(), valid)
         sigma = (np.sqrt(np.maximum(0, np.diag(self.ukf.P)[:3]))
                  if self.cfg.filter_enabled else np.full(3, np.nan))
+        if self.data_recorder is not None and self.data_recorder.row is not None:
+            self.data_recorder.row.update(range_update_performed=True, range_accepted=bool(valid), range_status=reason)
         self.history.append(dict(time_s=t, range_valid=bool(valid), healthy=True,
             filter_enabled=self.cfg.filter_enabled, range_status=reason,
             raw_slant_range_m=float(raw), used_slant_range_m=float(measured) if valid else np.nan,
@@ -521,6 +547,40 @@ class TerrainNavigation(sysModel.SysModel):
 
     def UpdateState(self, now):
         t = now*1e-9
+
+        # Acquire clean samples once, including modeled measurement noise.
+        measurements = self.shared_sensor_faults.acquire(
+            self.range_rng, self.cfg.range_sigma_m
+        )
+        sample_dt = 0.0 if self.fi_tick == 0 else self.sensor_period_s
+        if self.truth.isWritten():
+            ideal_xy = self.terrain.to_map(np.asarray(self.truth().r_BN_N))[:2]
+            xy = ideal_xy + self.noise.sample(sample_dt)
+        else:
+            ideal_xy = xy = np.full(2, np.nan)
+        measurements["Trans_x"], measurements["Trans_y"] = map(float, xy)
+
+        faulted = self.fault_injector.FI(self.fi_tick, measurements)
+        self.fi_tick += 1
+        checked = faulted  # Replace with fault detection when implemented.
+
+        # Publish clean snapshots, then overwrite the EXISTING live messages.
+        self.shared_sensor_faults.publish(checked, self.moduleID)
+        self.xy_measurement = np.array([checked["Trans_x"], checked["Trans_y"]])
+        self.xy_history.append(dict(time_s=t, clean_xy_m=xy.copy(),
+                                    xy_m=self.xy_measurement.copy()))
+
+        if self.data_recorder is not None:
+            ideal = dict(self.shared_sensor_faults.ideal_values)
+            ideal["Trans_x"], ideal["Trans_y"] = ideal_xy
+            self.data_recorder.begin(now, self, ideal, measurements, faulted)
+        try:
+            self._advance_navigation(now, t)
+        finally:
+            if self.data_recorder is not None:
+                self.data_recorder.finish(self)
+
+    def _advance_navigation(self, now, t):
         if not self.imu.isWritten() or t-self.imu.timeWritten()*1e-9 > 2*self.sensor_period_s+1e-9:
             self.healthy, self.fault_reason = False, 'stale_imu'
             return
@@ -528,9 +588,10 @@ class TerrainNavigation(sysModel.SysModel):
             return
         dt = 0. if self.last_s is None else t-self.last_s
         fix_due = self.last_fix_s is None or t-self.last_fix_s >= self.cfg.period_s-1e-8
+        # These subscribers now read the overwritten, post-FI messages.
         sensor = self.imu()
-        rate = self.dcm_PB.T @ (np.asarray(sensor.AngVelPlatform)-self.gyro_bias)
-        acceleration = self.dcm_PB.T @ (np.asarray(sensor.AccelPlatform)-self.accel_bias)
+        rate = self.dcm_PB.T @ (np.asarray(sensor.AngVelPlatform) - self.gyro_bias)
+        acceleration = self.dcm_PB.T @ (np.asarray(sensor.AccelPlatform) - self.accel_bias)
         if not np.isfinite(np.r_[rate, acceleration]).all():
             self.healthy, self.fault_reason = False, 'nonfinite_imu'
             return
@@ -553,6 +614,8 @@ class TerrainNavigation(sysModel.SysModel):
                 k1 = derivative(x); k2 = derivative(x+.5*dt*k1)
                 k3 = derivative(x+.5*dt*k2); k4 = derivative(x+dt*k3)
                 self.ukf.translation = x+dt/6*(k1+2*k2+2*k3+k4)
+            if self.data_recorder is not None:
+                self.data_recorder.predicted(self)
             self.last_imu_ns = self.imu.timeWritten()
             corrected = False
             if fix_due or not self.absolute_attitude:
@@ -572,7 +635,7 @@ class TerrainNavigation(sysModel.SysModel):
                 if self.cfg.filter_enabled:
                     command = self._command_acceleration()
                     if command is not None:
-                        self.ukf.update_acceleration(command, .001+.01*np.linalg.norm(command))
+                        self.ukf.update_acceleration(command, .001+.01*np.linalg.norm(command), label="command_acceleration")
                     self.ukf.update_acceleration(acceleration, self.cfg.accel_sigma_m_s2)
                 if self.truth.isWritten():
                     fix_dt = 0. if self.last_fix_s is None else t-self.last_fix_s

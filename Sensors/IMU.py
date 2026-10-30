@@ -1,4 +1,5 @@
 # IMU.py
+from Basilisk.architecture import messaging
 from Basilisk.simulation import imuSensor
 
 #Basing off of Raytheon's IMU25 MEMS Inertial Measurement Unit : https://www.rtx.com/collinsaerospace/-/media/CA/product-assets/marketing/i/imu/imu25-data-sheet.pdf?rev=8f46e99da92e49cb9407e4a3405b7a52
@@ -58,6 +59,8 @@ class IMU:
             "AngVelPlatform"    #Raw angular velocity measurement
         ]
 
+        self.cleanSensorOutMsg = messaging.IMUSensorMsg()
+        self.clean_recorder = None
         self.recorder = None                                #Initialize the logger/recorder variable
 
     # ------------------------------------------------------------------
@@ -79,6 +82,7 @@ class IMU:
         :return:
         """
 
+        self.clean_recorder = self.cleanSensorOutMsg.recorder(sampling_ns)
         self.recorder = self.model.sensorOutMsg.recorder(sampling_ns)
         return self.recorder
 

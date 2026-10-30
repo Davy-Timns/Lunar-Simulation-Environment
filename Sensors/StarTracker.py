@@ -1,4 +1,5 @@
 # StarTracker.py
+from Basilisk.architecture import messaging
 from Basilisk.simulation import starTracker
 from Basilisk.architecture.messaging.STSensorMsgPayload import STSensorMsgPayload
 
@@ -31,6 +32,8 @@ class StarTracker:
 
 
         #self.model.setAMatrix(self.model.getAMatrix())  #Set MRP shadow set
+        self.cleanSensorOutMsg = messaging.STSensorMsg()
+        self.clean_recorder = None
         self.recorder = None                            #Init recorder var
         self.fields = STSensorMsgPayload.__fields__()   #Retrieves all fields in the ST output message
 
@@ -48,6 +51,7 @@ class StarTracker:
         :param sampling_ns: Sampling rate freq
         :return:
         """
+        self.clean_recorder = self.cleanSensorOutMsg.recorder(sampling_ns)
         self.recorder = self.model.sensorOutMsg.recorder(sampling_ns)
         return self.recorder
 

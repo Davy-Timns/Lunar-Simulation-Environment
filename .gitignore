@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Generated ML datasets and per-run Vizard recordings
+results/ml_runs/

@@ -305,10 +305,6 @@ class LaserAltimeter(sysModel.SysModel):
         F_N, torque_B = self.get_contact_loads(r_mjc,v_mjc,omega_mjc,C_BN,R_mjc_to_bsk)
 
         #  MUJOCO -> BASILISK
-
-        if self.debug_contacts and self._debug_step_counter % max(1,self.debug_contact_every_n_steps) == 0:
-            print(f"Sim {current_time_s:9.2f} s | contact={self.collision} | "
-                  f"Contact force: {F_N} N | Torque: {torque_B} Nm", flush=True)
         self.publish_contact_loads(F_N,torque_B, CurrentSimNanos)
 
         #LASER ALTIMETER

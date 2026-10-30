@@ -50,7 +50,9 @@ class Vehicle:
             )
         self.engines = engines
         self.thruster_controller = controller
-        self.sim.AddModelToTask(task_name, controller, ModelPriority=20)
+        # Descent feedback follows same-tick sensor FI/navigation.
+        priority = 20 if isinstance(controller, ConstantControl) else -5
+        self.sim.AddModelToTask(task_name, controller, ModelPriority=priority)
         for name, engine in engines.items():
             engine.attach(self.lander, self.sim, task_name, priority=10)
             recorder = engine.thruster.thrusterOutMsgs[0].recorder(self.sampling_ns)
@@ -192,6 +194,23 @@ class Vehicle:
             "imu": imu_output,
             "star_tracker": st_output,
             "altimeter": alt_output,
+            "clean_sensors": {
+                "imu": {
+                    name: {field: getattr(imu.clean_recorder, field) for field in imu.fields}
+                    for name, imu in self.imus.items()
+                },
+                "star_tracker": {
+                    name: {field: getattr(st.clean_recorder, field) for field in st.fields}
+                    for name, st in self.star_trackers.items()
+                },
+                "altimeter": {
+                    name: {"time_s": alt.clean_recorder.times() * 1e-9,
+                           "timeTag": alt.clean_recorder.timeTag,
+                           "altitude": alt.clean_recorder.r_BN_N}
+                    for name, alt in self.altimeters.items()
+                },
+                "map_xy_history": getattr(self.navigation, "xy_history", []),
+            } if getattr(self, "navigation", None) is not None else {},
             "thrusters": {
                 name: {
                     "time_ns": recorder.times(),

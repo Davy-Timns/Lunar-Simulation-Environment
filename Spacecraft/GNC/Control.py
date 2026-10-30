@@ -550,6 +550,14 @@ class TouchdownDiagnostics(sysModel.SysModel):
             self.touchdown = touchdown_metrics(state.r_BN_N, state.v_BN_N, target,
                 vehicle.terrain_map, fuel, controller.initial_state.mass - controller.settings.dry_mass,
                 t, ignition, ignition, controller.terminal_start_s)
+            from SimulationData import terrain_tilt_deg
+            up_N = vehicle.terrain_map.up_N
+            self.touchdown.update(
+                position_N_m=list(state.r_BN_N), quaternion_N_to_B_wxyz=RigidBodyKinematics.MRP2EP(state.sigma_BN).tolist(),
+                angular_rate_B_rad_s=list(state.omega_BN_B),
+                angular_speed_rad_s=float(np.linalg.norm(state.omega_BN_B)),
+                tilt_from_local_vertical_deg=float(np.rad2deg(np.arccos(np.clip(np.dot(c_NB[:,2], up_N), -1, 1)))),
+                tilt_from_terrain_normal_deg=terrain_tilt_deg(c_NB, vehicle.terrain_map, state.r_BN_N))
             self.touchdown.update(self.peaks)
             self.touchdown['cutoff'] = controller.cutoff_event
             self.touchdown['acceleration_definition'] = 'specific load |engine + contact force| / mass; gravity excluded'
@@ -581,8 +589,9 @@ def terminal_metrics(position, velocity, target_position, target_velocity, radiu
                 contact_landing_verified=False)
 
 
-def save_descent_report(vehicle, directory):
-    import matplotlib.pyplot as plt
+def save_descent_report(vehicle, directory, make_plots=True):
+    if make_plots:
+        import matplotlib.pyplot as plt
     from Basilisk.utilities import RigidBodyKinematics
     controller = vehicle.thruster_controller
     cfg = controller.settings
@@ -650,43 +659,44 @@ def save_descent_report(vehicle, directory):
             truth_position_N=nr_true,truth_velocity_N=nv_true,range_valid=valid,
             position_sigma_m=[h['position_sigma_m'] for h in nh],range_status=status,
             filter_enabled=navigation.cfg.filter_enabled,**laser_data)
-        laserfig,laseraxes=plt.subplots(3,1,figsize=(11,9),layout='constrained',sharex=True)
-        lt=(nt-cfg.coast_duration_s)/60
-        raw=laser_data['raw_slant_range_m'].copy()
-        raw[(raw<0)|~np.isfinite(raw)]=np.nan
-        laseraxes[0].plot(lt,raw,label='Raw return',alpha=.65)
-        laseraxes[0].plot(lt,laser_data['used_slant_range_m'],label='Accepted noisy range')
-        laseraxes[0].set(ylabel='Beam slant range (m)')
-        laseraxes[1].plot(lt,laser_data['estimated_map_z_m'],label='Navigation map Z')
-        laseraxes[1].plot(lt,laser_data['laser_observed_map_z_m'],'.',ms=2,label='Laser + DEM observed Z')
-        if hasattr(vehicle,'terrain_map'):
-            laseraxes[1].plot(lt,vehicle.terrain_map.to_map(nr_true)[:,2],':',label='Truth Z (comparison only)')
-        laseraxes[1].set(ylabel='Map Z (m)')
-        codes={name:i for i,name in enumerate(('no_return','stale','over_range','beam_not_downward',
-                                              'footprint_unmapped','negative_noisy_range','accepted'))}
-        laseraxes[2].step(lt,[codes[s] for s in status],where='post',label='Navigation range decision')
-        laseraxes[2].set(yticks=list(codes.values()),yticklabels=list(codes),xlabel='Time since ignition (min)')
-        for ax in laseraxes:
-            ax.grid(alpha=.25);ax.legend()
-        laserfig.suptitle('Laser measurement use — navigation predicts Z whenever a range is rejected')
-        laserfig.savefig(directory/'laser_navigation_diagnostics.png',dpi=150)
-        # A second view prevents the long coast from hiding the useful returns.
-        if valid.any():
-            laseraxes[2].set_xlim(lt[valid][0]-.1,lt[-1]+.1)
-            z_values=np.r_[laser_data['estimated_map_z_m'][valid],laser_data['laser_observed_map_z_m'][valid]]
-            margin=max(1.,float(np.ptp(z_values))*.05)
-            laseraxes[1].set_ylim(float(np.min(z_values))-margin,float(np.max(z_values))+margin)
-            laseraxes[0].set_ylim(0,max(1.,float(np.max(laser_data['used_slant_range_m'][valid]))*1.1))
-            laserfig.savefig(directory/'laser_navigation_closeup.png',dpi=150)
-        plt.close(laserfig)
-        navfig,navaxes=plt.subplots(2,1,figsize=(9,6),layout='constrained')
-        navaxes[0].plot((nt-cfg.coast_duration_s)/60,errors)
-        navaxes[0].set(ylabel='Position estimate error (m)',yscale='symlog')
-        navaxes[1].plot((nt-cfg.coast_duration_s)/60,valid.astype(int))
-        navaxes[1].set(ylabel='Laser update valid',yticks=[0,1],xlabel='Time since ignition (min)')
-        for ax in navaxes: ax.grid(alpha=.25)
-        navfig.savefig(directory/'navigation_diagnostics.png',dpi=150)
-        plt.close(navfig)
+        if make_plots:
+            laserfig,laseraxes=plt.subplots(3,1,figsize=(11,9),layout='constrained',sharex=True)
+            lt=(nt-cfg.coast_duration_s)/60
+            raw=laser_data['raw_slant_range_m'].copy()
+            raw[(raw<0)|~np.isfinite(raw)]=np.nan
+            laseraxes[0].plot(lt,raw,label='Raw return',alpha=.65)
+            laseraxes[0].plot(lt,laser_data['used_slant_range_m'],label='Accepted noisy range')
+            laseraxes[0].set(ylabel='Beam slant range (m)')
+            laseraxes[1].plot(lt,laser_data['estimated_map_z_m'],label='Navigation map Z')
+            laseraxes[1].plot(lt,laser_data['laser_observed_map_z_m'],'.',ms=2,label='Laser + DEM observed Z')
+            if hasattr(vehicle,'terrain_map'):
+                laseraxes[1].plot(lt,vehicle.terrain_map.to_map(nr_true)[:,2],':',label='Truth Z (comparison only)')
+            laseraxes[1].set(ylabel='Map Z (m)')
+            codes={name:i for i,name in enumerate(('no_return','stale','over_range','beam_not_downward',
+                                                  'footprint_unmapped','negative_noisy_range','accepted'))}
+            laseraxes[2].step(lt,[codes[s] for s in status],where='post',label='Navigation range decision')
+            laseraxes[2].set(yticks=list(codes.values()),yticklabels=list(codes),xlabel='Time since ignition (min)')
+            for ax in laseraxes:
+                ax.grid(alpha=.25);ax.legend()
+            laserfig.suptitle('Laser measurement use — navigation predicts Z whenever a range is rejected')
+            laserfig.savefig(directory/'laser_navigation_diagnostics.png',dpi=150)
+            # A second view prevents the long coast from hiding the useful returns.
+            if valid.any():
+                laseraxes[2].set_xlim(lt[valid][0]-.1,lt[-1]+.1)
+                z_values=np.r_[laser_data['estimated_map_z_m'][valid],laser_data['laser_observed_map_z_m'][valid]]
+                margin=max(1.,float(np.ptp(z_values))*.05)
+                laseraxes[1].set_ylim(float(np.min(z_values))-margin,float(np.max(z_values))+margin)
+                laseraxes[0].set_ylim(0,max(1.,float(np.max(laser_data['used_slant_range_m'][valid]))*1.1))
+                laserfig.savefig(directory/'laser_navigation_closeup.png',dpi=150)
+            plt.close(laserfig)
+            navfig,navaxes=plt.subplots(2,1,figsize=(9,6),layout='constrained')
+            navaxes[0].plot((nt-cfg.coast_duration_s)/60,errors)
+            navaxes[0].set(ylabel='Position estimate error (m)',yscale='symlog')
+            navaxes[1].plot((nt-cfg.coast_duration_s)/60,valid.astype(int))
+            navaxes[1].set(ylabel='Laser update valid',yticks=[0,1],xlabel='Time since ignition (min)')
+            for ax in navaxes: ax.grid(alpha=.25)
+            navfig.savefig(directory/'navigation_diagnostics.png',dpi=150)
+            plt.close(navfig)
     attitude = getattr(vehicle, 'navigation', None)
     if attitude is not None and attitude.attitude_history:
         ah = attitude.attitude_history
@@ -701,44 +711,48 @@ def save_descent_report(vehicle, directory):
         np.savez_compressed(directory/'touchdown_acceleration.npz',
             **{key: np.array([h[key] for h in monitor.history]) for key in monitor.history[0]})
     (directory/'descent_report.json').write_text(json.dumps(report,indent=2))
-    fig,axes = plt.subplots(3,2,figsize=(11,10),layout='constrained')
-    powered = time >= cfg.coast_duration_s
-    t = (time[powered]-cfg.coast_duration_s)/60
-    axes[0,0].plot(t,altitude[powered]); axes[0,0].axhline(0,color='black',lw=.8)
-    axes[0,0].set(ylabel='Reference altitude (m)')
-    up = r / np.linalg.norm(r,axis=1)[:,None]
-    radial = np.sum(v*up,axis=1)
-    horizontal = np.linalg.norm(v-radial[:,None]*up,axis=1)
-    axes[0,1].plot(t,radial[powered],label='Radial (+ upward)')
-    axes[0,1].plot(t,horizontal[powered],label='Horizontal')
-    axes[0,1].set(ylabel='Velocity (m/s)'); axes[0,1].legend()
     history = [h for h in controller.history if 'main_thrust' in h]
-    axes[1,0].plot([(h['time_s']-cfg.coast_duration_s)/60 for h in history],
-                   [h['main_thrust'] for h in history])
-    axes[1,0].set(ylabel='Main thrust (N)')
-    ht = np.array([(h['time_s']-cfg.coast_duration_s)/60 for h in history])
-    for field,label in [('requested_radial_thrust_N','Requested'),('applied_radial_thrust_N','Applied')]:
-        axes[1,1].plot(ht,[h.get(field, np.nan) for h in history],label=label)
-    axes[1,1].axhline(0,color='black',lw=.8)
-    axes[1,1].set(ylabel='Radial thrust (+ upward, N)',yscale='symlog')
-    axes[1,1].legend()
-    ft = np.asarray(vehicle.fuel_recorder.times())*1e-9
-    fm = np.asarray(vehicle.fuel_recorder.fuelMass)
-    axes[2,0].plot((ft[ft>=cfg.coast_duration_s]-cfg.coast_duration_s)/60,fm[ft>=cfg.coast_duration_s])
-    axes[2,0].set(ylabel='Propellant remaining (kg)')
-    axes[2,1].plot(ht,[h.get('position_error', np.nan) for h in history])
-    axes[2,1].set(ylabel='Target position error (m)')
     keys = ('time_s','reference_altitude_m','radial_speed_m_s','horizontal_speed_m_s',
             'requested_radial_thrust_N','applied_radial_thrust_N','force_error_N','main_thrust','mass')
     np.savez_compressed(directory/'descent_guidance.npz',
                         **{key: np.array([h.get(key, np.nan) for h in history]) for key in keys})
-    for ax in axes.flat:
-        ax.set_xlabel('Time since ignition (min)'); ax.grid(alpha=.25)
     verdict = ('Contact landing verified in simulation' if report['contact_landing_verified'] else
                'Precision target met; contact unverified' if report['precision_target_met'] else 'Landing target NOT achieved')
-    fig.suptitle(f"{verdict}: error {report['position_error_m']:.2f} m, {report['velocity_error_m_s']:.2f} m/s")
-    fig.savefig(directory/'descent_diagnostics.png',dpi=160)
-    plt.close(fig)
+    if make_plots:
+        fig,axes = plt.subplots(3,2,figsize=(11,10),layout='constrained')
+        powered = time >= cfg.coast_duration_s
+        t = (time[powered]-cfg.coast_duration_s)/60
+        axes[0,0].plot(t,altitude[powered]); axes[0,0].axhline(0,color='black',lw=.8)
+        axes[0,0].set(ylabel='Reference altitude (m)')
+        up = r / np.linalg.norm(r,axis=1)[:,None]
+        radial = np.sum(v*up,axis=1)
+        horizontal = np.linalg.norm(v-radial[:,None]*up,axis=1)
+        axes[0,1].plot(t,radial[powered],label='Radial (+ upward)')
+        axes[0,1].plot(t,horizontal[powered],label='Horizontal')
+        axes[0,1].set(ylabel='Velocity (m/s)'); axes[0,1].legend()
+        history = [h for h in controller.history if 'main_thrust' in h]
+        axes[1,0].plot([(h['time_s']-cfg.coast_duration_s)/60 for h in history],
+                       [h['main_thrust'] for h in history])
+        axes[1,0].set(ylabel='Main thrust (N)')
+        ht = np.array([(h['time_s']-cfg.coast_duration_s)/60 for h in history])
+        for field,label in [('requested_radial_thrust_N','Requested'),('applied_radial_thrust_N','Applied')]:
+            axes[1,1].plot(ht,[h.get(field, np.nan) for h in history],label=label)
+        axes[1,1].axhline(0,color='black',lw=.8)
+        axes[1,1].set(ylabel='Radial thrust (+ upward, N)',yscale='symlog')
+        axes[1,1].legend()
+        ft = np.asarray(vehicle.fuel_recorder.times())*1e-9
+        fm = np.asarray(vehicle.fuel_recorder.fuelMass)
+        axes[2,0].plot((ft[ft>=cfg.coast_duration_s]-cfg.coast_duration_s)/60,fm[ft>=cfg.coast_duration_s])
+        axes[2,0].set(ylabel='Propellant remaining (kg)')
+        axes[2,1].plot(ht,[h.get('position_error', np.nan) for h in history])
+        axes[2,1].set(ylabel='Target position error (m)')
+        for ax in axes.flat:
+            ax.set_xlabel('Time since ignition (min)'); ax.grid(alpha=.25)
+        verdict = ('Contact landing verified in simulation' if report['contact_landing_verified'] else
+                   'Precision target met; contact unverified' if report['precision_target_met'] else 'Landing target NOT achieved')
+        fig.suptitle(f"{verdict}: error {report['position_error_m']:.2f} m, {report['velocity_error_m_s']:.2f} m/s")
+        fig.savefig(directory/'descent_diagnostics.png',dpi=160)
+        plt.close(fig)
     print(f"Descent assessment: {verdict}. Position error {report['position_error_m']:.3f} m; "
           f"velocity error {report['velocity_error_m_s']:.3f} m/s.",flush=True)
     print('Descent report:',(directory/'descent_report.json').resolve(),flush=True)
